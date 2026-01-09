@@ -1,0 +1,7 @@
+streamlit
+rank_bm25
+sentence-transformers
+transformers
+torch
+numpy
+docling
