@@ -17,3 +17,10 @@ rank_bm25
 sentence-transformers
 streamlit
 numpy
+
+# RAG Generation & Evaluation
+ragas
+langchain
+langchain-mistralai
+langchain-openai
+datasets

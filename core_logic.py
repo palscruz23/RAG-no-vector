@@ -121,6 +121,186 @@ def tree_search(node, query, depth_limit=5, model=None):
 
     return tree_search(best_child, query, depth_limit, model=model)
 
+def tree_search_beam(root, query, beam_width=3, depth_limit=5, model=None):
+    """
+    Beam search: Maintains multiple candidate paths through the tree.
+
+    Args:
+        root: Root node of the tree
+        query: Search query string
+        beam_width: Number of best candidates to keep at each level (default: 3)
+        depth_limit: Maximum depth to search (default: 5)
+        model: Embedding model for scoring
+
+    Returns:
+        Best leaf node found
+    """
+    # Clear history at the start
+    st.session_state.search_history = []
+
+    # Initialize beam with root and score 0
+    beam = [(root, 0.0, [])]  # (node, cumulative_score, path)
+
+    for depth in range(depth_limit):
+        candidates = []
+        all_children_at_level = []
+
+        # Expand all nodes in current beam
+        for node, cum_score, path in beam:
+            if not node.children:
+                # Leaf node - keep it as a candidate
+                candidates.append((node, cum_score, path))
+                continue
+
+            # Score children of this node
+            ranked_results = node.get_rrf_score(query, model=model)
+
+            if not ranked_results:
+                candidates.append((node, cum_score, path))
+                continue
+
+            # Add all children as candidates
+            for child, score in ranked_results:
+                new_path = path + [child.title]
+                candidates.append((child, cum_score + score, new_path))
+                all_children_at_level.append((child, score))
+
+        if not candidates:
+            break
+
+        # Sort by cumulative score and keep top beam_width
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        beam = candidates[:beam_width]
+
+        # Record this level for visualization (show all candidates considered)
+        if all_children_at_level:
+            # Get unique children and their best scores
+            child_scores = {}
+            for child, score in all_children_at_level:
+                if child.title not in child_scores or score > child_scores[child.title]:
+                    child_scores[child.title] = score
+
+            # Create candidates list sorted by score
+            level_candidates = [{"Node": title, "RRF Score": f"{score:.4f}"}
+                              for title, score in sorted(child_scores.items(),
+                                                        key=lambda x: x[1],
+                                                        reverse=True)]
+
+            # Winner is the top beam candidate at this level
+            winner = beam[0][0].title if beam else "None"
+
+            st.session_state.search_history.append({
+                "level": depth + 1,
+                "winner": winner,
+                "candidates": level_candidates,
+                "beam_size": len(beam)
+            })
+
+        # Check if all beam candidates are leaf nodes
+        if all(not node.children for node, _, _ in beam):
+            break
+
+    # Return the best node from the final beam
+    if beam:
+        return beam[0][0]
+    else:
+        return root
+
+def get_top_k_results(root, query, k=3, method="greedy", beam_width=3, depth_limit=5, model=None):
+    """
+    Get top-K most relevant document sections for RAG.
+
+    Args:
+        root: Root node of the tree
+        query: Search query
+        k: Number of top results to return (default: 3)
+        method: "greedy" or "beam"
+        beam_width: Beam width for beam search
+        depth_limit: Maximum depth to search
+        model: Embedding model
+
+    Returns:
+        List of (node, score) tuples, sorted by relevance
+    """
+    if method == "beam":
+        # Use beam search to get diverse candidates
+        st.session_state.search_history = []
+        beam = [(root, 0.0, [])]
+
+        all_leaf_candidates = []
+
+        for depth in range(depth_limit):
+            candidates = []
+
+            for node, cum_score, path in beam:
+                if not node.children:
+                    # Leaf node - add to final candidates
+                    all_leaf_candidates.append((node, cum_score))
+                    candidates.append((node, cum_score, path))
+                    continue
+
+                ranked_results = node.get_rrf_score(query, model=model)
+                if not ranked_results:
+                    candidates.append((node, cum_score, path))
+                    continue
+
+                for child, score in ranked_results:
+                    new_path = path + [child.title]
+                    new_cum_score = cum_score + score
+                    candidates.append((child, new_cum_score, new_path))
+
+                    # If child is a leaf, add to candidates
+                    if not child.children:
+                        all_leaf_candidates.append((child, new_cum_score))
+
+            if not candidates:
+                break
+
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            beam = candidates[:beam_width * 2]  # Keep more candidates for diversity
+
+            if all(not node.children for node, _, _ in beam):
+                break
+
+        # Get top k from all leaf candidates
+        all_leaf_candidates.sort(key=lambda x: x[1], reverse=True)
+        return all_leaf_candidates[:k]
+
+    else:
+        # Greedy search: get best path, then get siblings at each level
+        best_path = []
+        current_node = root
+
+        # First, get the greedy path
+        for depth in range(depth_limit):
+            if not current_node.children:
+                break
+
+            ranked_results = current_node.get_rrf_score(query, model=model)
+            if not ranked_results:
+                break
+
+            best_child, best_score = ranked_results[0]
+            best_path.append((best_child, best_score))
+            current_node = best_child
+
+        # Now collect top candidates from the final level
+        if best_path:
+            final_node = best_path[-1][0]
+            parent = root
+
+            # Navigate to parent of final node
+            for node, _ in best_path[:-1]:
+                parent = node
+
+            # Get all siblings scored
+            if parent.children:
+                ranked_results = parent.get_rrf_score(query, model=model)
+                return ranked_results[:k]
+
+        # Fallback: just return the single result
+        return [(current_node, 1.0)]
+
 def display_tree(node, prefix="", is_last=True, query=None, model=None):
     """Recursively displays the document hierarchy in folder structure format with relevance scores."""
 
@@ -488,4 +668,122 @@ def get_embedding_model():
     
     # Load from the local path
     return SentenceTransformer(MODEL_PATH)
+
+def generate_rag_answer(query, top_k_results, model_name="mistral-large-latest"):
+    """
+    Generate answer using RAG with top-k retrieved contexts.
+
+    Args:
+        query: User's question
+        top_k_results: List of (node, score) tuples from retrieval
+        model_name: Mistral model to use
+
+    Returns:
+        Generated answer string
+    """
+    from mistralai import Mistral
+
+    # Extract contexts from results
+    contexts = []
+    for node, score in top_k_results:
+        context_text = f"**{node.title}**\n{node.content}"
+        contexts.append(context_text)
+
+    # Combine contexts
+    combined_context = "\n\n---\n\n".join(contexts)
+
+    # Create prompt
+    prompt = f"""You are a helpful assistant answering questions based on the provided document sections.
+
+Use ONLY the information from the following document sections to answer the question. If the answer is not in the provided sections, say so.
+
+Document Sections:
+{combined_context}
+
+Question: {query}
+
+Answer: Provide a clear, accurate answer based only on the information above. Cite which section(s) you used."""
+
+    # Call Mistral API
+    api_key = os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        return "Error: MISTRAL_API_KEY not found in environment variables."
+
+    client = Mistral(api_key=api_key)
+
+    messages = [{"role": "user", "content": prompt}]
+
+    response = client.chat.complete(
+        model=model_name,
+        messages=messages
+    )
+
+    return response.choices[0].message.content
+
+def evaluate_with_ragas(query, answer, contexts, ground_truth=None):
+    """
+    Evaluate RAG response using RAGAS metrics.
+
+    Args:
+        query: User's question
+        answer: Generated answer
+        contexts: List of context strings used
+        ground_truth: Optional reference answer
+
+    Returns:
+        Dictionary of evaluation scores
+    """
+    try:
+        from datasets import Dataset
+        from ragas import evaluate
+        from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
+        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+        # Check for OpenAI API key
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return {"error": "OPENAI_API_KEY not found in environment variables. Please add it to your .env file."}
+
+        # Create OpenAI LLM for judging
+        llm = ChatOpenAI(
+            model="gpt-5-mini",
+            api_key=api_key,
+            temperature=0
+        )
+
+        # Create OpenAI embeddings for RAGAS metrics
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            api_key=api_key
+        )
+
+        # Prepare data for RAGAS
+        data = {
+            "question": [query],
+            "answer": [answer],
+            "contexts": [contexts],
+        }
+
+        # Add ground truth if provided
+        if ground_truth:
+            data["ground_truth"] = [ground_truth]
+            metrics = [faithfulness, answer_relevancy, context_precision, context_recall]
+        else:
+            # Without ground truth, use metrics that don't require it
+            metrics = [faithfulness, answer_relevancy]
+
+        dataset = Dataset.from_dict(data)
+
+        # Evaluate with both LLM and embeddings
+        result = evaluate(
+            dataset,
+            metrics=metrics,
+            llm=llm,
+            embeddings=embeddings
+        )
+
+        return result
+
+    except Exception as e:
+        return {"error": str(e)}
 
