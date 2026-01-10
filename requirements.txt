@@ -1,7 +1,19 @@
-streamlit
+# Use the official PyTorch CPU index to avoid downloading 2GB+ of CUDA drivers
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Core Dependencies
+torch
+torchvision
+torchaudio
+
+# OCR & Document Processing
+marker-pdf
+mistralai
+PyMuPDF
+Pillow
+
+# RAG & UI Components
 rank_bm25
 sentence-transformers
-transformers
-torch
+streamlit
 numpy
-docling
